@@ -1,6 +1,9 @@
 package timewheel
 
 import (
+	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -14,7 +17,10 @@ type TimeWheel struct {
 	intervalMS  int64      // 时间轮最大间隔 = ticketMS * wheelSize
 	buckets     []*Bucket  // 槽
 	curBucket   int        // 当前所在槽
-	overflow    *TimeWheel // 下一层时间轮
+	overflow    *TimeWheel // 下一层时间轮（单位时间更大）
+	prevTW      *TimeWheel // 上一层时间轮
+	firstTW     *TimeWheel // 首层时间轮
+	level       int
 	sync.Locker
 
 	wg       *sync.WaitGroup
@@ -44,10 +50,14 @@ func NewTimeWheel(ticket time.Duration, wheelSize int) *TimeWheel {
 		buckets:     buckets,
 		curBucket:   0,
 		overflow:    nil,
+		firstTW:     nil,
+		prevTW:      nil,
+		level:       1,
 		Locker:      &sync.Mutex{},
 		wg:          &sync.WaitGroup{},
 		exitC:       make(chan struct{}),
 	}
+	tw.firstTW = tw
 	return tw
 }
 
@@ -58,49 +68,73 @@ func (w *TimeWheel) Start() {
 
 		ticker := time.NewTicker(time.Duration(w.ticketMS) * time.Millisecond)
 		defer ticker.Stop()
-		select {
-		case <-w.exitC:
-			return
-		case <-ticker.C:
-			w.Lock()
-			defer w.Unlock()
-			now := time.Now()
-			w.advanceClock(now)
+
+		startTime := w.curTicketMS
+		_ = startTime
+
+		for {
+			select {
+			case <-w.exitC:
+				return
+			case <-ticker.C:
+				w.Lock()
+				now := time.Now().Truncate(time.Millisecond)
+				elapsed := now.Sub(time.UnixMilli(startTime))
+				elapsedMS := elapsed.Milliseconds()
+				_ = elapsedMS
+				//fmt.Printf("Tick %s\tElapse:%s\n", now, elapsed)
+				w.advanceClock(now)
+				//w.printDebug()
+				w.Unlock()
+			}
 		}
 	}()
 }
 
+func (w *TimeWheel) printDebug() {
+	bucketStat := make([]string, 0, len(w.buckets))
+	for _, o := range w.buckets {
+		bucketStat = append(bucketStat, strconv.Itoa(o.timers.Len()))
+	}
+	bucketStat[w.curBucket] = fmt.Sprintf("[%s]", bucketStat[w.curBucket])
+	fmt.Printf("TimeWheel【%d-%d-%d】%s\n", w.level, w.ticketMS, w.wheelSize, strings.Join(bucketStat, ","))
+	if w.overflow != nil {
+		w.overflow.printDebug()
+	}
+}
+
 func (w *TimeWheel) advanceClock(now time.Time) {
-	nowMS := now.UnixMilli()
+	elapseMS := now.UnixMilli() - w.curTicketMS
 
 	// 时间不足以跨一个刻度
-	if nowMS < w.curTicketMS+w.ticketMS {
+	if elapseMS < w.ticketMS {
 		return
 	}
 
-	passedTick := int((nowMS - w.curTicketMS) / w.ticketMS)
-	if int64(passedTick) >= w.intervalMS {
+	elapseTick := int(elapseMS / w.ticketMS)
+	w.curTicketMS = CalcCurTicketMS(w.ticketMS, now)
+	if int64(elapseTick) >= w.intervalMS {
 		// 避免时间跳跃过大导致浪费
-		passedTick = w.wheelSize + (passedTick % w.wheelSize)
+		elapseTick = w.wheelSize + (elapseTick % w.wheelSize)
 	}
 
-	for i := 0; i < passedTick; i++ {
+	for i := 0; i < elapseTick; i++ {
 		w.curBucket = (w.curBucket + 1) % w.wheelSize
+
 		trigger := w.buckets[w.curBucket].Flush()
 		if len(trigger) == 0 {
 			continue
 		}
-		w.wg.Add(len(trigger))
-		for _, o := range trigger {
-			o := o
-			go func() {
-				defer w.wg.Done()
-				o.cb()
-			}()
+
+		for _, timer := range trigger {
+			w.firstTW.addTimer(timer)
 		}
 	}
 
-	w.getNextTW().advanceClock(now)
+	// 仅在一个循环后再推动下层
+	if w.overflow != nil {
+		w.overflow.advanceClock(now)
+	}
 }
 
 // Stop 可重复调用
@@ -118,45 +152,52 @@ func (w *TimeWheel) Stop() {
 func (w *TimeWheel) getNextTW() *TimeWheel {
 	if w.overflow == nil {
 		tw := NewTimeWheel(time.Millisecond*time.Duration(w.ticketMS*int64(w.wheelSize)), w.wheelSize)
-		tw.curTicketMS = w.curTicketMS
+		tw.curTicketMS = CalcCurTicketMS(tw.ticketMS, time.UnixMilli(w.curTicketMS))
+		tw.wg = w.wg
+		tw.Locker = w
+		tw.exitC = w.exitC
+		tw.firstTW = w.firstTW
+		tw.prevTW = w
+		tw.level = w.level + 1
+
 		w.overflow = tw
 	}
 	return w.overflow
 }
 
-func (w *TimeWheel) addOrRun(t *Timer) {
+func (w *TimeWheel) addTimer(t *Timer) {
 	// 已取消
 	if t.IsCanceled() {
 		return
 	}
 
-	if !w.add(t) {
+	if w.stopSign {
+		return
+	}
+
+	delay := t.expireMS - w.curTicketMS
+
+	// 已超时
+	if delay < w.ticketMS {
 		w.wg.Add(1)
 		go func() {
 			defer w.wg.Done()
 			t.cb()
 		}()
-	}
-}
-
-func (w *TimeWheel) add(t *Timer) bool {
-	curTicketMS := w.curTicketMS
-
-	// 已超时
-	if t.expireMS < curTicketMS+w.ticketMS {
-		return false
+		return
 	}
 
 	// 属于当前层时间范围
-	if t.expireMS < curTicketMS+w.intervalMS {
-		targetIdx := (int(t.expireMS/w.ticketMS) + w.curBucket) % w.wheelSize
+	if delay < w.intervalMS {
+		targetIdx := (int(delay/w.ticketMS) + w.curBucket) % w.wheelSize
 		t.wheel = w
+		t.bucket = w.buckets[targetIdx]
 		w.buckets[targetIdx].AddTimer(t)
-		return true
+		return
 	}
 
-	// 往更高层放
-	return w.getNextTW().add(t)
+	// 往下一层放
+	w.getNextTW().addTimer(t)
 }
 
 func (w *TimeWheel) AfterFunc(after time.Duration, cb func()) *Timer {
@@ -164,10 +205,10 @@ func (w *TimeWheel) AfterFunc(after time.Duration, cb func()) *Timer {
 	defer w.Unlock()
 
 	t := &Timer{
-		expireMS: time.Now().Add(after).UnixMilli(),
+		expireMS: time.Now().UnixMilli() + after.Milliseconds(),
 		cb:       cb,
 	}
-	w.addOrRun(t)
+	w.addTimer(t)
 	return t
 }
 
@@ -183,17 +224,22 @@ func (w *TimeWheel) ScheduleFunc(scheduler Scheduler, cb func()) (t *Timer) {
 	t = &Timer{
 		expireMS: next.UnixMilli(),
 		cb: func() {
-			next := scheduler.Next(time.Now())
-
 			cb()
 
+			next := scheduler.Next(time.UnixMilli(t.expireMS))
 			if !next.IsZero() {
+				// 防止执行间隔过短导致的额外重复执行
+				if next.UnixMilli()-w.curTicketMS < w.ticketMS {
+					next = time.UnixMilli(w.curTicketMS + w.ticketMS)
+				}
+				t.expireMS = next.UnixMilli()
+
 				w.Lock()
 				defer w.Unlock()
-				w.addOrRun(t)
+				w.firstTW.addTimer(t)
 			}
 		},
 	}
-	w.addOrRun(t)
+	w.addTimer(t)
 	return t
 }

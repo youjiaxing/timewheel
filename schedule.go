@@ -15,3 +15,15 @@ type EverySecond struct {
 func (s EverySecond) Next(t time.Time) time.Time {
 	return t.Add(time.Second)
 }
+
+type Every struct {
+	Delay time.Duration
+}
+
+func NewEvery(delay time.Duration) *Every {
+	return &Every{Delay: delay}
+}
+
+func (e Every) Next(t time.Time) time.Time {
+	return t.Add(e.Delay)
+}
